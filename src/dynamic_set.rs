@@ -7,142 +7,147 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use hashbrown::hash_table::{Entry as TableEntry, HashTable};
 use parking_lot::Mutex;
 use std::borrow::Cow;
-use std::cell::UnsafeCell;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering::SeqCst;
 
-const NB_BUCKETS: usize = 1 << 12; // 4096
-const BUCKET_MASK: u64 = (1 << 12) - 1;
+/// Each shard has its own lock, so that threads interning different strings
+/// seldom wait for one another.
+const NB_SHARDS: usize = 1 << 8;
+
+/// A shard's table is shrunk once it is filled to less than a quarter, so that
+/// it takes memory in the atoms alive rather than the most that ever were.
+const MIN_CAPACITY_TO_SHRINK: usize = 64;
 
 pub(crate) struct Set {
-    buckets: Box<[Mutex<Option<NonNull<Entry>>>]>,
+    /// Keys the hash that places a string in a shard and in the shard's table.
+    /// It is random in each process, so strings cannot be chosen in advance to
+    /// share a place and make every insertion step past all of them.
+    hasher: RandomState,
+    /// Entries are leaked boxes, freed by `remove` once out of their table.
+    shards: Box<[Mutex<HashTable<NonNull<Entry>>>]>,
 }
 
 pub(crate) struct Entry {
-    // These fields can be accessed freely by `Atom` methods
     pub(crate) string: Box<str>,
     pub(crate) hash: u64,
     pub(crate) ref_count: AtomicIsize,
-    // This field is protected by a `Mutex` in `Set`
-    next_in_bucket: UnsafeCell<Option<NonNull<Entry>>>,
+    /// `string` hashed with the set's `hasher`.
+    set_hash: u64,
 }
 
-// SAFETY: Access to the global linked list is strictly guarded by a Mutex,
-// and the reference counts are atomic. Even though `NonNull` is strictly
-// `!Send` and `!Sync`, the surrounding architecture makes it safe to share.
-unsafe impl Send for Entry {}
-unsafe impl Sync for Entry {}
-
+// SAFETY: the tables hold pointers to entries only while their shard's lock is
+// held, and an entry's fields are immutable except for its atomic count.
 unsafe impl Send for Set {}
 unsafe impl Sync for Set {}
 
 pub(crate) fn dynamic_set() -> &'static Set {
-    // NOTE: Using const initialization for buckets breaks the small-stack test.
+    // NOTE: Using const initialization for shards breaks the small-stack test.
     static DYNAMIC_SET: OnceLock<Set> = OnceLock::new();
 
-    DYNAMIC_SET.get_or_init(|| {
-        let buckets = (0..NB_BUCKETS).map(|_| Mutex::new(None)).collect();
-        Set { buckets }
+    DYNAMIC_SET.get_or_init(|| Set {
+        hasher: RandomState::new(),
+        shards: (0..NB_SHARDS)
+            .map(|_| Mutex::new(HashTable::new()))
+            .collect(),
     })
 }
 
+fn set_hash_of(ptr: &NonNull<Entry>) -> u64 {
+    // SAFETY: a table holds only live entries; `remove` takes an entry out of
+    // its table, under the shard's lock, before it frees it.
+    unsafe { ptr.as_ref() }.set_hash
+}
+
 impl Set {
+    fn shard(&self, set_hash: u64) -> &Mutex<HashTable<NonNull<Entry>>> {
+        // A table places entries by the low bits of the hash and tells them
+        // apart by the top seven, so the shard takes bits from the middle.
+        &self.shards[(set_hash >> 32) as usize % NB_SHARDS]
+    }
+
     pub(crate) fn insert(&self, string: Cow<str>, hash: u64) -> NonNull<Entry> {
-        let bucket_index = (hash & BUCKET_MASK) as usize;
-        let mut linked_list = self.buckets[bucket_index].lock();
-
-        {
-            let mut ptr: Option<NonNull<Entry>> = *linked_list;
-
-            while let Some(entry_ptr) = ptr {
-                // SAFETY: We hold the Mutex lock for this bucket, so no other thread can mutate
-                // the linked list. The `NonNull` pointer is guaranteed to point to a valid Entry.
-                let entry = unsafe { entry_ptr.as_ref() };
-                if entry.hash == hash && *entry.string == *string {
-                    let old_size = entry.ref_count.fetch_add(1, SeqCst);
-                    if old_size > 0 {
-                        if old_size == isize::MAX {
-                            std::process::abort();
-                        }
-                        return entry_ptr;
+        let set_hash = self.hasher.hash_one(&*string);
+        let mut table = self.shard(set_hash).lock();
+        let same_string = |ptr: &NonNull<Entry>| {
+            // SAFETY: as in `set_hash_of`.
+            *unsafe { ptr.as_ref() }.string == *string
+        };
+        let vacant = match table.entry(set_hash, same_string, set_hash_of) {
+            TableEntry::Occupied(occupied) => {
+                let ptr = *occupied.get();
+                // SAFETY: as in `set_hash_of`.
+                let entry = unsafe { ptr.as_ref() };
+                let old_count = entry.ref_count.fetch_add(1, SeqCst);
+                if old_count > 0 {
+                    if old_count == isize::MAX {
+                        std::process::abort();
                     }
-                    // Uh-oh. The pointer's reference count was zero, which means someone may try
-                    // to free it. (Naive attempts to defend against this, for example having the
-                    // destructor check to see whether the reference count is indeed zero, don't
-                    // work due to ABA.) Thus we need to temporarily add a duplicate string to the
-                    // list.
-                    entry.ref_count.fetch_sub(1, SeqCst);
-                    break;
+                    return ptr;
                 }
-                // SAFETY: We hold the Mutex lock for this bucket, so no other thread can mutate
-                // the linked list.
-                ptr = unsafe { entry.next_in_bucket.get().read() };
+                // The entry's last atom is being dropped, and its `remove` waits
+                // for this lock to free it. (Naive attempts to defend against this,
+                // for example having `remove` check to see whether the reference
+                // count is indeed zero, don't work due to ABA.) So the entry leaves
+                // the table, for `remove` to free it, and a new one takes its place.
+                entry.ref_count.fetch_sub(1, SeqCst);
+                occupied.remove().1
             }
-        }
-        let string = string.into_owned();
+            TableEntry::Vacant(vacant) => vacant,
+        };
         let entry = Box::new(Entry {
-            next_in_bucket: UnsafeCell::new(linked_list.take()),
+            string: string.into_owned().into_boxed_str(),
             hash,
             ref_count: AtomicIsize::new(1),
-            string: string.into_boxed_str(),
+            set_hash,
         });
         let ptr = NonNull::from(Box::leak(entry));
-        *linked_list = Some(ptr);
+        vacant.insert(ptr);
         ptr
     }
 
     pub(crate) fn remove(&self, ptr: *mut Entry) {
-        // SAFETY: The caller provides a pointer derived from a valid Atom. We hold the lock
-        // below, and `ptr` is guaranteed to be valid until we drop the `Box` later in this function.
-        let value: &Entry = unsafe { &*ptr };
-        let bucket_index = (value.hash & BUCKET_MASK) as usize;
-
-        let mut lock_guard = self.buckets[bucket_index].lock();
-        debug_assert!(value.ref_count.load(SeqCst) == 0);
-        let mut current: &mut Option<NonNull<Entry>> = &mut lock_guard;
-
-        while let Some(entry_ptr) = *current {
-            if entry_ptr.as_ptr() == ptr {
-                // SAFETY: The reference count has reached 0, and we hold the bucket lock.
-                // We have exclusive access to recreate the Box and deallocate the memory.
-                let unlinked_entry = unsafe { Box::from_raw(entry_ptr.as_ptr()) };
-                *current = unlinked_entry.next_in_bucket.into_inner();
-                // We’re done accessing data protected by the mutex
-                drop(lock_guard);
-                // The `Box` is deallocated here after releasing the lock
-                break;
+        // SAFETY: `ptr` is the entry of an atom whose drop took its count to
+        // zero, and only this call frees it.
+        let set_hash = unsafe { &*ptr }.set_hash;
+        let mut table = self.shard(set_hash).lock();
+        debug_assert!(unsafe { &*ptr }.ref_count.load(SeqCst) == 0);
+        // `insert` takes the entry out of the table itself when it finds it dead.
+        if let Ok(occupied) = table.find_entry(set_hash, |p| p.as_ptr() == ptr) {
+            occupied.remove();
+            let len = table.len();
+            if table.capacity() >= MIN_CAPACITY_TO_SHRINK && len * 4 < table.capacity() {
+                table.shrink_to(len * 2, set_hash_of);
             }
-            // SAFETY: We hold the bucket lock, so the pointer remains valid and unaliased here.
-            // Still, don’t create `&mut Entry` here because `Atom` methods may have a `&Entry`.
-            let entry = unsafe { entry_ptr.as_ref() };
-            // SAFETY: The `UnsafeCell` is safe to access here because we hold the `Mutex`
-            current = unsafe { &mut *entry.next_in_bucket.get() };
         }
+        drop(table);
+        // SAFETY: the entry is out of the table, so no other thread can reach it
+        // (`Atom` methods hold no reference to it past the dropped atom). The
+        // memory is freed after releasing the lock.
+        drop(unsafe { Box::from_raw(ptr) });
     }
 }
 
 #[cfg(feature = "malloc_size_of")]
 pub fn malloc_size_of_dynamic_set(ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
     let mut sum = 0;
-    for bucket in &dynamic_set().buckets {
-        let guard = bucket.lock();
-        let mut next: Option<NonNull<Entry>> = *guard;
-        while let Some(ptr) = next {
+    for shard in &dynamic_set().shards {
+        let table = shard.lock();
+        sum += table.allocation_size();
+        for ptr in table.iter() {
             // We would use `<Box<Entry> as malloc_size_of::MallocSizeOf>` here,
             // but we don’t have `&Box<Entry>` only `NonNull<Entry>`.
             // SAFETY: `ptr` is a valid heap-allocated pointer
             sum += unsafe { ops.malloc_size_of::<Entry>(ptr.as_ptr()) };
-
-            // SAFETY: `ptr` is a valid pointer
+            // SAFETY: as in `set_hash_of`.
             let entry = unsafe { ptr.as_ref() };
             sum += <Box<str> as malloc_size_of::MallocSizeOf>::size_of(&entry.string, ops);
-
-            // SAFETY: `UnsafeCell` is safe to access since we’re holding the `Mutex`
-            next = unsafe { *entry.next_in_bucket.get() };
         }
     }
     sum
