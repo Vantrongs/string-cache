@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/servo/string-cache"
 documentation = "https://docs.rs/string_cache"
 edition = "2018"
-rust-version = "1.70.0"
+rust-version = "1.85"
 
 # Do not `exclude` ./string-cache-codegen because we want to include
 # ./string-cache-codegen/shared.rs, and `include` is a pain to use
@@ -29,6 +29,7 @@ malloc_size_of = { version = "0.1", default-features = false, optional = true }
 phf_shared = "0.13"
 new_debug_unreachable = "1.0.2"
 parking_lot = "0.12"
+hashbrown = { version = "0.17", default-features = false }
 
 [[test]]
 name = "small-stack"
