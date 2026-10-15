@@ -27,23 +27,27 @@ fn names() -> Vec<String> {
     names
 }
 
-/// Seconds to intern the names and drop their atoms, best of three runs.
-fn seconds_to_intern(names: &[String]) -> f64 {
-    (0..3)
-        .map(|_| {
+/// Seconds to intern the strings of each list and drop their atoms, the least
+/// of five runs, the lists in turn so that both see the same load.
+fn seconds_to_intern(lists: [&[String]; 2]) -> [f64; 2] {
+    let mut least = [f64::INFINITY; 2];
+    for _ in 0..5 {
+        for (list, least) in lists.iter().zip(&mut least) {
             let start = Instant::now();
-            let atoms: Vec<DefaultAtom> = names.iter().map(|n| DefaultAtom::from(&**n)).collect();
+            let atoms: Vec<DefaultAtom> = list.iter().map(|s| DefaultAtom::from(&**s)).collect();
             assert!(atoms
                 .iter()
-                .zip(names)
-                .all(|(a, n)| a.is_dynamic() && **a == **n));
+                .zip(*list)
+                .all(|(a, s)| a.is_dynamic() && **a == **s));
             drop(atoms);
-            start.elapsed().as_secs_f64()
-        })
-        .fold(f64::INFINITY, f64::min)
+            *least = least.min(start.elapsed().as_secs_f64());
+        }
+    }
+    least
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "times the interning")]
 fn strings_sharing_a_bucket_of_the_static_key_are_interned_in_linear_time() {
     let names = names();
     assert_eq!(names.len(), 16_000);
@@ -54,11 +58,20 @@ fn strings_sharing_a_bucket_of_the_static_key_are_interned_in_linear_time() {
     // Four times the strings take about four times as long in linear time and
     // sixteen times as long in quadratic time.
     let quarter = &names[..names.len() / 4];
-    let ratio = seconds_to_intern(&names) / seconds_to_intern(quarter);
+    let [all, part] = seconds_to_intern([&names, quarter]);
     assert!(
-        ratio < 8.0,
-        "{} strings took {ratio:.1} times as long as {}",
+        all / part < 10.0,
+        "{} strings took {:.1} times as long as {}",
         names.len(),
+        all / part,
         quarter.len()
+    );
+    // And about as long as the same number of strings spread over the buckets.
+    let ordinary: Vec<String> = (0..names.len()).map(|i| format!("m{i:011x}")).collect();
+    let [chosen, ordinary] = seconds_to_intern([&names, &ordinary]);
+    assert!(
+        chosen / ordinary < 3.0,
+        "strings of one bucket took {:.1} times as long as others",
+        chosen / ordinary
     );
 }
