@@ -307,6 +307,22 @@ fn test_try_static() {
     assert!(Atom::try_static("not in the static table").is_none());
 }
 
+#[test]
+fn hash_is_the_sets_own_while_another_set_holds_the_string() {
+    // Longer than an inline atom and in neither static set, so both atoms are
+    // dynamic; the two sets hash strings with different keys.
+    let text = "not in any static table";
+    let own = Atom::from(text).get_hash();
+    let other = string_cache::DefaultAtom::from(text);
+    assert_ne!(other.get_hash(), own);
+    let atom = Atom::from(text);
+    assert_eq!(atom.get_hash(), own);
+    drop(other);
+    let other = string_cache::DefaultAtom::from(text);
+    assert_ne!(other.get_hash(), own);
+    assert_eq!(&*other, &*atom);
+}
+
 #[cfg(test)]
 #[path = "common-usage.rs"]
 mod common_usage;
