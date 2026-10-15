@@ -75,11 +75,14 @@ impl Set {
     pub(crate) fn insert(&self, string: Cow<str>, hash: u64) -> NonNull<Entry> {
         let set_hash = self.hasher.hash_one(&*string);
         let mut table = self.shard(set_hash).lock();
-        let same_string = |ptr: &NonNull<Entry>| {
+        // Atoms of static sets with different keys hash a string differently,
+        // so each set has its own entry for it, as `get_hash` returns `hash`.
+        let same_atom = |ptr: &NonNull<Entry>| {
             // SAFETY: as in `set_hash_of`.
-            *unsafe { ptr.as_ref() }.string == *string
+            let entry = unsafe { ptr.as_ref() };
+            entry.hash == hash && *entry.string == *string
         };
-        let vacant = match table.entry(set_hash, same_string, set_hash_of) {
+        let vacant = match table.entry(set_hash, same_atom, set_hash_of) {
             TableEntry::Occupied(occupied) => {
                 let ptr = *occupied.get();
                 // SAFETY: as in `set_hash_of`.
